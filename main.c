@@ -400,17 +400,35 @@ Cursor leaf_node_find(Table* table, uint32_t page_num, uint32_t key){
     return cursor; 
 }
 
-Cursor table_start(Table* table){
-    Cursor cursor; 
-    cursor.table = table; 
-    cursor.page_num = table->root_page_num; 
-    cursor.cell_num = 0; 
 
-    void* root_node = get_page(table->pager, cursor.page_num); 
-    uint32_t num_cells = *leaf_node_num_cells(root_node);
-    cursor.end_of_table = (num_cells == 0);
 
-    return cursor; 
+Cursor internal_node_find(Table* table, uint32_t page_num, uint32_t key) {
+  void* node = get_page(table->pager, page_num);
+  uint32_t num_keys = *internal_node_num_keys(node);
+
+  uint32_t min_index = 0;
+  uint32_t max_index = num_keys; 
+
+  while (min_index != max_index) {
+    uint32_t index = (min_index + max_index) / 2;
+    uint32_t key_to_right = *internal_node_key(node, index);
+    
+    if (key_to_right >= key) {
+      max_index = index;
+    } else {
+      min_index = index + 1;
+    }
+  }
+
+  uint32_t child_num = *internal_node_child(node, min_index);
+  void* child = get_page(table->pager, child_num);
+  
+  switch (get_node_type(child)) {
+    case NODE_LEAF:
+      return leaf_node_find(table, child_num, key);
+    case NODE_INTERNAL:
+      return internal_node_find(table, child_num, key);
+  }
 }
 
 Cursor table_find(Table* table, uint32_t key){
@@ -421,9 +439,18 @@ Cursor table_find(Table* table, uint32_t key){
         return leaf_node_find(table, root_page_num, key);
     }
     else{
-        printf("Need to implement searching an internal node.\n");
-        exit(EXIT_FAILURE); 
+        return internal_node_find(table, root_page_num, key);
     }
+}
+
+Cursor table_start(Table* table){
+    Cursor cursor = table_find(table,0);
+
+    void* root_node = get_page(table->pager, cursor.page_num); 
+    uint32_t num_cells = *leaf_node_num_cells(root_node);
+    cursor.end_of_table = (num_cells == 0);
+
+    return cursor; 
 }
 
 void pager_flush(Pager* pager, uint32_t page_num, uint32_t size){
@@ -525,10 +552,6 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
     }
   }
 
-  if (num_cells >= LEAF_NODE_MAX_CELLS) {
-    return EXECUTE_TABLE_FULL;
-  }
-
   leaf_node_insert(&cursor, row_to_insert->id, row_to_insert);
 
   return EXECUTE_SUCCESS;
@@ -586,11 +609,53 @@ void close_input_buffer(InputBuffer* input_buffer){
     free(input_buffer); 
 }
 
+void indent(uint32_t level){
+    for(uint32_t i = 0; i < level; i++){
+        printf("  ");
+    }
+}
+
+void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level) {
+  void* node = get_page(pager, page_num);
+  uint32_t num_keys, child;
+
+  switch (get_node_type(node)) {
+    case (NODE_LEAF):
+      num_keys = *leaf_node_num_cells(node);
+      indent(indentation_level);
+      printf("- leaf (size %d)\n", num_keys);
+      for (uint32_t i = 0; i < num_keys; i++) {
+        indent(indentation_level + 1);
+        printf("- %d\n", *leaf_node_key(node, i));
+      }
+      break;
+    case (NODE_INTERNAL):
+      num_keys = *internal_node_num_keys(node);
+      indent(indentation_level);
+      printf("- internal (size %d)\n", num_keys);
+      for (uint32_t i = 0; i < num_keys; i++) {
+        child = *internal_node_child(node, i);
+        print_tree(pager, child, indentation_level + 1);
+
+        indent(indentation_level + 1);
+        printf("- key %d\n", *internal_node_key(node, i));
+      }
+      child = *internal_node_right_child(node);
+      print_tree(pager, child, indentation_level + 1);
+      break;
+  }
+}
+
 MetaCommandResult do_meta_command(InputBuffer* input_buffer,Table* table){
     if(strcmp(input_buffer->buffer, ".exit") == 0){
         close_input_buffer(input_buffer);
         db_close(table); 
         exit(EXIT_SUCCESS);
+    }
+    if(strcmp(input_buffer->buffer, ".btree") == 0){
+        printf("Tree:\n");
+        print_tree(table->pager, 0, 0);
+        return META_COMMAND_SUCCESS;
     }
     else{
         return META_COMMAND_UNRECOGNIZED_COMMAND;
