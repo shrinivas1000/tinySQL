@@ -109,14 +109,16 @@ const uint32_t COMMON_NODE_HEADER_SIZE = 8;
 // leaf node header layout
 const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
 const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
-const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE; // 6+4 = 10 bytes
+const uint32_t LEAF_NODE_NEXT_LEAF_SIZE = sizeof(uint32_t); //to store the page no of next leaf
+const uint32_t LEAF_NODE_NEXT_LEAF_OFFSET =
+    LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;
+const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_NEXT_LEAF_SIZE;
 
 // leaf Node Body Layout -> since a leaf node will actually store data
 const uint32_t LEAF_NODE_KEY_SIZE = sizeof(uint32_t);
 const uint32_t LEAF_NODE_KEY_OFFSET = 0;
 const uint32_t LEAF_NODE_VALUE_SIZE = ROW_SIZE;
-const uint32_t LEAF_NODE_VALUE_OFFSET =
-    LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
+const uint32_t LEAF_NODE_VALUE_OFFSET = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
 const uint32_t LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
 const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE; //4096 - 10 = 4086 bytes
 const uint32_t LEAF_NODE_MAX_CELLS =
@@ -159,6 +161,11 @@ void set_node_root(void* node, bool is_root) {
   uint8_t value = is_root;
   *((uint8_t*)((char*)node + IS_ROOT_OFFSET)) = value;
 }
+
+uint32_t* leaf_node_next_leaf(void* node){
+    return node + LEAF_NODE_NEXT_LEAF_OFFSET;
+}
+
 
 uint32_t* internal_node_num_keys(void* node) {
   return node + INTERNAL_NODE_NUM_KEYS_OFFSET;
@@ -210,6 +217,7 @@ void initialize_leaf_node(void* node) {
     set_node_type(node, NODE_LEAF);
     set_node_root(node, false);
     *leaf_node_num_cells(node) = 0; 
+    *leaf_node_next_leaf(node) = 0; 
 }
 
 void initialize_internal_node(void* node) {
@@ -341,6 +349,9 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value){
 
     *(leaf_node_num_cells(old_node)) = LEAF_NODE_LEFT_SPLIT_COUNT;
     *(leaf_node_num_cells(new_node)) = LEAF_NODE_RIGHT_SPLIT_COUNT;
+
+    *leaf_node_next_leaf(new_node) = *leaf_node_next_leaf(old_node);
+    *leaf_node_next_leaf(old_node) = new_page_num;
 
     if(is_node_root(old_node)){
         return create_new_root(cursor->table, new_page_num);
@@ -509,8 +520,16 @@ void cursor_next(Cursor* cursor) {
   uint32_t page_num = cursor->page_num;
   void* node = get_page(cursor->table->pager, page_num);
   cursor->cell_num += 1;
+
   if (cursor->cell_num >= (*leaf_node_num_cells(node))) {
-    cursor->end_of_table = true;
+    uint32_t next_page_num = *leaf_node_next_leaf(node);
+    if (next_page_num == 0){
+        cursor->end_of_table = true; 
+    }
+    else{
+        cursor->page_num = next_page_num; 
+        cursor->cell_num = 0; 
+    } 
   }
 }
 
