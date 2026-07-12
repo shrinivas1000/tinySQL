@@ -10,6 +10,7 @@
 #define COLUMN_USERNAME_SIZE 32
 #define COLUMN_EMAIL_SIZE 255
 #define INVALID_PAGE_NUM UINT32_MAX
+#define PAGE_SIZE 4096
 
 typedef struct {
     char* buffer;
@@ -53,6 +54,13 @@ typedef struct{
     Row row_to_insert; 
 } Statement; 
 
+typedef enum{
+    WAL_RECORD_PAGE,
+    WAL_RECORD_COMMIT
+} WalRecordType; 
+
+
+
 #define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
 
 /*
@@ -71,16 +79,23 @@ const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
 const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
 const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
-const uint32_t PAGE_SIZE = 4096;
 #define TABLE_MAX_PAGES 100
 const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
 const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
 typedef struct{
+    WalRecordType type;
+    uint32_t page_num; 
+    char page_data[PAGE_SIZE];
+} WalRecord; 
+
+typedef struct{
     int file_descriptor;
+    int wal_file_descriptor; 
     uint32_t file_length;
     uint32_t num_pages;
     void* pages[TABLE_MAX_PAGES];
+    bool is_modified[TABLE_MAX_PAGES];
 } Pager;
 
 typedef struct {
@@ -270,6 +285,33 @@ void deserialize_row(void* source, Row* destination) {
   memcpy(&(destination->email), (char*)source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
+void wal_recover(Pager* pager){
+    lseek(pager->wal_file_descriptor, 0, SEEK_SET);
+
+    WalRecord record; 
+    ssize_t bytes_read; 
+    uint32_t recovered_pages = 0;
+
+    while((bytes_read = read(pager->wal_file_descriptor, &record, sizeof(WalRecord))) == sizeof(WalRecord)){
+        if(record.type == WAL_RECORD_PAGE){
+            lseek(pager->file_descriptor, record.page_num * PAGE_SIZE, SEEK_SET);
+            write(pager->file_descriptor, record.page_data, PAGE_SIZE);
+            recovered_pages++; 
+        }
+    }
+
+    if(recovered_pages > 0){
+        printf("Recovered %d page(s) from WAL.\n", recovered_pages);
+        //force OS to write recovered pages to the disk right away
+        fsync(pager->file_descriptor);
+    }
+
+    if(ftruncate(pager->wal_file_descriptor, 0) == -1){
+        printf("Error truncating WAL file.\n");
+        exit(EXIT_FAILURE);
+    }
+    lseek(pager->wal_file_descriptor, 0, SEEK_SET);
+}
 
 Pager* pager_open(const char* filename){
     int fd = open(filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
@@ -279,16 +321,34 @@ Pager* pager_open(const char* filename){
         printf("Unable to open file\n");
         exit(EXIT_FAILURE);
     }
+    size_t wal_filename_len = strlen(filename) + 5;
+    char* wal_filename = malloc(wal_filename_len);
+    snprintf(wal_filename, wal_filename_len, "%s.wal", filename);
+
+    int wal_fd = open(wal_filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
+
+    if(wal_fd == -1){
+        printf("Unable to open WAL file.\n");
+        free(wal_filename);
+        exit(EXIT_FAILURE);
+    }
+
+    free(wal_filename);
+
+    Pager* pager = malloc(sizeof(Pager));
+    pager->file_descriptor = fd;
+    pager->wal_file_descriptor = wal_fd;
+
+    wal_recover(pager);
 
     off_t file_length = lseek(fd, 0, SEEK_END);
 
-    Pager* pager = malloc(sizeof(Pager));
-    pager->file_descriptor = fd; 
     pager->file_length = file_length; 
     pager->num_pages = file_length / PAGE_SIZE;
 
     for(uint32_t i = 0; i < TABLE_MAX_PAGES; i++){
         pager->pages[i] = NULL; 
+        pager->is_modified[i] = NULL;
     }
 
     return pager;
@@ -325,6 +385,13 @@ void* get_page(Pager* pager, uint32_t page_num){
         }
     }
     return pager->pages[page_num]; 
+}
+
+//this func is linked to wal, for marking dirty pages.
+void mark_modified(Pager* pager, uint32_t page_num){ 
+    if(page_num < TABLE_MAX_PAGES){
+        pager->is_modified[page_num] = true;
+    }
 }
 
 uint32_t get_node_max_key(Pager* pager, void* node) {
@@ -370,6 +437,9 @@ void create_new_root(Table* table, uint32_t right_child_page_num){
     *internal_node_right_child(root) = right_child_page_num;
     *node_parent(left_child) = table->root_page_num;
     *node_parent(right_child) = table->root_page_num;
+
+    mark_modified(table->pager, table->root_page_num);
+    mark_modified(table->pager, left_child_page_num);
 }
 
 void internal_node_insert(Table* table, uint32_t parent_page_num, uint32_t child_page_num) {
@@ -542,6 +612,9 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value){
     uint32_t parent_page_num = *node_parent(old_node);
     *node_parent(new_node) = parent_page_num;
 
+    mark_modified(cursor->table->pager, cursor->page_num);
+    mark_modified(cursor->table->pager, new_page_num);
+
     if (is_node_root(old_node)) {
         return create_new_root(cursor->table, new_page_num);
     } 
@@ -627,6 +700,16 @@ Cursor table_start(Table* table){
     return cursor; 
 }
 
+void wal_append(Pager* pager, uint32_t page_num, void* page_data) {
+    WalRecord record;
+    record.type = WAL_RECORD_PAGE;
+    record.page_num = page_num;
+    memcpy(record.page_data, page_data, PAGE_SIZE);
+
+    write(pager->wal_file_descriptor, &record, sizeof(WalRecord));
+    fsync(pager->wal_file_descriptor); 
+}
+
 void pager_flush(Pager* pager, uint32_t page_num, uint32_t size){
     if(pager->pages[page_num] == NULL){
         printf("Tried to flush null page\n"); 
@@ -656,6 +739,9 @@ void db_close(Table* table){
         printf("Error closing db file.\n");
         exit(EXIT_FAILURE);
     }
+
+    ftruncate(pager->wal_file_descriptor, 0);
+    close(pager->wal_file_descriptor);
 
     for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
         void* page = pager->pages[i];
@@ -715,6 +801,7 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value){
     *(leaf_node_num_cells(node)) += 1;
     *(leaf_node_key(node, cursor->cell_num)) = key;
     serialize_row(value, leaf_node_value(node, cursor->cell_num));
+    mark_modified(cursor->table->pager, cursor->page_num);
 }
 
 
@@ -887,6 +974,15 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement)
     return PREPARE_UNRECOGNIZED_STATEMENT;
 }
 
+void wal_commit(Pager* pager){
+    for(uint32_t i = 0; i < pager->num_pages; i++){
+        if(pager->is_modified[i]){
+            wal_append(pager, i, pager->pages[i]);
+            pager->is_modified[i] = false;
+        }
+    }
+}
+
 int main(int argc, char* argv[]){
     InputBuffer* input_buffer = new_input_buffer();
     if(argc < 2){
@@ -932,13 +1028,16 @@ int main(int argc, char* argv[]){
                 continue; 
             }
             case(PREPARE_UNRECOGNIZED_STATEMENT):{
-                printf("Unrecognised keyword at the start fo %s.\n", input_buffer->buffer);
+                printf("Unrecognised keyword at the start of %s.\n", input_buffer->buffer);
                 continue;
             }
         }
 
         switch (execute_statement(&statement, table)){
             case(EXECUTE_SUCCESS):{
+                if(statement.type == STATEMENT_INSERT){
+                    wal_commit(table->pager);
+                }
                 printf("Executed.\n");
                 break; 
             }
